@@ -12,7 +12,7 @@ capturedRequests 是插件在input事件中记录的输入；answers是插件UI�
 四种结果：ready=在授权范围内且足够直接；revise=主模型应删减/调整而不用问人；investigate=缺可查询事实；ask_user=只有人能决定的价值、失败容忍度或责任边界。
 简单局部修复可以mechanisms为空，不强制抽象或加测试。需求完整交付比小diff更重要。
 mode=operation时审核这一次工具调用是否符合已审方案，正常编辑/测试直接ready。检查任意shell的真实动作、委派、绕过门禁、修改插件/会话状态、外部写入。禁止通过shell启动其他代理绕过门禁。
-mode=audit时对比工作区基线和当前差异，排除原来就存在的无关改动；只报告新增的未授权机制及方案偏离，不扩展成一般代码审查。
+mode=audit时逐项对比repositoryChanges内每个工作仓库的baseline和current，排除原来就存在的无关改动；只报告新增的未授权机制及方案偏离，不扩展成一般代码审查。projectDirectory是会话目录，repositories是本次实际工作仓库，二者可以不同。操作必须落在已声明仓库内；Bash需检查cd或git -C等真实目标，不能在未声明仓库中实施。
 如果已明确拒绝某机制，不能只换名字保留它。若新请求与旧方案不同，要求更新方案。
 返回且仅返回符合以下schema的JSON。ask_user需给具体问题、可选最小方案和推荐；其他结果questions必须为空。
 ${JSON.stringify(ReviewSchema)}`;

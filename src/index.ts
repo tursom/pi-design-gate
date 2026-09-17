@@ -1,6 +1,7 @@
 import { Type } from 'typebox';
 import { createBashToolDefinition, createEditToolDefinition, createWriteToolDefinition, createPowerShellToolDefinition, type ExtensionAPI, type ExtensionContext, type ToolDefinition } from '@earendil-works/pi-coding-agent';
-import { inspect, readEvidence, workspaceReference, workspaceSnapshot } from './context.ts';
+import { inspect, projectPath, readEvidence } from './context.ts';
+import { checkWriteRepository, repositoryBaselines, repositoryChanges, repositoryRoot, resolveRepositories } from './repositories.ts';
 import { classify, preliminaryGate, type Call } from './gate.ts';
 import { ProposalSchema, validateProposal, type Review } from './schema.ts';
 import { reviewWithModel, type Reviewer } from './review.ts';
@@ -14,6 +15,7 @@ export function registerDesignGate(pi: ExtensionAPI, reviewer: Reviewer = review
   const currentStatus = () => state.value.status;
   const permits = new Map<string, { epoch: number; input: string }>();
   let dialogOpen = false;
+  let projectDirectory = '';
 
   // PI may preflight a batch before execution. Recheck the exact reviewed
   // arguments and epoch at execute, rather than relying on a cached allow.
@@ -43,6 +45,8 @@ export function registerDesignGate(pi: ExtensionAPI, reviewer: Reviewer = review
     mode,
     capturedRequests: state.value.requests,
     proposal: state.value.proposal,
+    projectDirectory,
+    repositories: state.value.repositories,
     answers: state.value.answers,
     priorReview: state.value.review,
     ...extra,
@@ -80,6 +84,7 @@ export function registerDesignGate(pi: ExtensionAPI, reviewer: Reviewer = review
   }
 
   const restore = (ctx: ExtensionContext) => {
+    projectDirectory = ctx.cwd;
     state.restore(ctx.sessionManager.getBranch());
     permits.clear();
     status(ctx);
@@ -97,7 +102,7 @@ export function registerDesignGate(pi: ExtensionAPI, reviewer: Reviewer = review
   });
   pi.on('before_agent_start', () => ({
     message: { customType: 'design-gate-context', display: false,
-      content: `设计门禁已启用，状态=${state.value.status}。实施前必须调用 design_context 获取插件记录的请求ID，再调用 design_review 提交当前目标、验收条件及新增机制的必要性判断。简单修复可用空mechanisms。使用read/grep/find/ls或design_inspect调查；未放行时Bash不可用。design_review不得和实施工具同批调用。revise先简化，investigate先调查，ask_user等待插件对话框决定；不能通过ask_user的普通文字结果自行标记批准。已确认回答复用。子代理本版不开放。实施调用还会核对方案范围。`,
+      content: `设计门禁已启用，状态=${state.value.status}。实施前必须调用 design_context 获取插件记录的请求ID，再调用 design_review 提交当前目标、验收条件及新增机制的必要性判断。会话目录可以不是Git仓库：在proposal.repositories列出本次实际仓库路径（相对于会话目录），多仓库分别建基线；design_inspect.path选择查询目录。省略repositories时使用当前目录所在的仓库。简单修复可用空mechanisms。使用read/grep/find/ls或design_inspect调查；未放行时Bash不可用。design_review不得和实施工具同批调用。revise先简化，investigate先调查，ask_user等待插件对话框决定；不能通过ask_user的普通文字结果自行标记批准。已确认回答复用。子代理本版不开放。实施调用还会核对方案范围。`,
     },
   }));
 
@@ -110,6 +115,7 @@ export function registerDesignGate(pi: ExtensionAPI, reviewer: Reviewer = review
       if (value.length > 45_000) {
         return textResult(JSON.stringify({ status: state.value.status, version: state.value.version,
           requests: state.value.requests.slice(-5), proposal: state.value.proposal,
+          repositories: state.value.repositories,
           review: state.value.review, answers: state.value.answers,
           note: '只展示最近5条输入；审查仍使用全部已捕获输入。' }, null, 2).slice(0, 48_000));
       }
@@ -118,20 +124,23 @@ export function registerDesignGate(pi: ExtensionAPI, reviewer: Reviewer = review
   });
   pi.registerTool({
     name: 'design_inspect', label: 'Design Inspect',
-    description: '设计阶段的结构化只读查询：files/search/status/diff/log。search使用pattern；不执行shell字符串，输出最多约40KB。',
-    parameters: Type.Object({ action: Type.String({ enum: ['files', 'search', 'status', 'diff', 'log'] }), pattern: Type.Optional(Type.String({ maxLength: 1000 })) }),
+    description: '设计阶段的结构化只读查询：files/search/status/diff/log。path相对于会话目录，选择实际工作仓库或搜索目录；search使用pattern。不执行shell字符串，输出最多约40KB。',
+    parameters: Type.Object({ action: Type.String({ enum: ['files', 'search', 'status', 'diff', 'log'] }), pattern: Type.Optional(Type.String({ maxLength: 1000 })), path: Type.Optional(Type.String({ minLength: 1 })) }),
     async execute(_id, params, signal, _update, ctx) {
-      return textResult(await inspect(pi, ctx, params.action, params.pattern, signal));
+      const cwd = ['status', 'diff', 'log'].includes(params.action)
+        ? await repositoryRoot(pi, ctx, params.path ?? '.', signal)
+        : await projectPath(ctx.cwd, params.path ?? '.');
+      return textResult(await inspect(pi, { ...ctx, cwd }, params.action, params.pattern, signal));
     },
   });
 
   async function audit(ctx: ExtensionContext, signal?: AbortSignal) {
-    if (!state.value.proposal || state.value.baseline === undefined) throw new Error('尚无方案和工作区基线。');
+    if (!state.value.proposal || !state.value.baselines?.length) throw new Error('尚无方案和工作仓库基线。');
     const epoch = state.epoch;
-    const current = await workspaceSnapshot(pi, ctx, signal, state.value.baselineRef);
+    const changes = await repositoryChanges(pi, ctx, state.value.baselines, signal);
     if (state.epoch !== epoch) throw new Error('上下文已变化，工作区审查取消。');
-    if (current === state.value.baseline) { state.clean(); return textResult('工作区与审查基线一致。'); }
-    const result = await reviewer(ctx, payload('audit', { baseline: state.value.baseline, current }), signal);
+    if (changes.every(c => c.current === c.baseline)) { state.clean(); return textResult('所有工作仓库均与审查基线一致。'); }
+    const result = await reviewer(ctx, payload('audit', { repositoryChanges: changes }), signal);
     if (!state.finish(epoch, result.review)) throw new Error('审查期间任务已变化，未使用过期结果。');
     if (result.review.verdict === 'ready') state.clean();
     feedback(result.review);
@@ -162,11 +171,11 @@ export function registerDesignGate(pi: ExtensionAPI, reviewer: Reviewer = review
       status(ctx);
       try {
         const evidence = await readEvidence(ctx.cwd, proposal, state.value);
-        const baselineRef = state.value.baselineRef ?? await workspaceReference(pi, ctx, signal);
-        const baseline = state.value.baseline ?? await workspaceSnapshot(pi, ctx, signal, baselineRef);
+        const repositories = await resolveRepositories(pi, ctx, proposal.repositories, signal);
+        const baselines = await repositoryBaselines(pi, ctx, repositories, state.value.baselines, signal);
         if (state.epoch !== epoch) throw new Error('任务已变化，请重新提交。');
         // Save without advancing the epoch of this in-flight review.
-        state.value = { ...state.value, baseline, baselineRef };
+        state.value = { ...state.value, repositories, baselines };
         pi.appendEntry(STATE_ENTRY, state.value);
         const result = await reviewer(ctx, payload('proposal', { evidence }), signal);
         if (!state.finish(epoch, result.review)) throw new Error('任务已变化，审查结果已丢弃。');
@@ -190,6 +199,9 @@ export function registerDesignGate(pi: ExtensionAPI, reviewer: Reviewer = review
       const reason = await preliminaryGate(call, state, ctx);
       if (reason) return block(reason);
       if (classify(call) !== 'mutation') return;
+      if (call.toolName === 'edit' || call.toolName === 'write') {
+        await checkWriteRepository(pi, ctx, String(call.input.path), state.value.repositories ?? []);
+      }
       if (state.epoch !== epoch || state.value.status !== 'ready') return block('初步检查期间任务已变化，未放行。');
       const result = await reviewer(ctx, payload('operation', { tool: call }), ctx.signal);
       // Persist nested usage on the eventual tool result, including blocked calls.

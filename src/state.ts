@@ -4,6 +4,7 @@ import type { Proposal, Review } from './schema.ts';
 export const STATE_ENTRY = 'design-gate/state-v1';
 export type Request = { id: string; source: 'interactive' | 'rpc'; text: string };
 export type Answer = { proposalVersion: number; question: string; answer: string };
+export type RepositoryBaseline = { root: string; baseline: string; baselineRef: string };
 export type State = {
   schema: 1;
   version: number;
@@ -13,8 +14,8 @@ export type State = {
   review?: Review;
   answers: Answer[];
   dirty: boolean;
-  baseline?: string;
-  baselineRef?: string;
+  repositories?: string[];
+  baselines?: RepositoryBaseline[];
 };
 export const initialState = (): State => ({ schema: 1, version: 0, status: 'investigate', requests: [], answers: [], dirty: false });
 
@@ -32,8 +33,7 @@ export class GateState {
   }
   request(text: string, source: Request['source']): void {
     this.set({ ...this.value, version: this.value.version + 1, status: 'investigate',
-      baseline: this.value.dirty ? this.value.baseline : undefined,
-      baselineRef: this.value.dirty ? this.value.baselineRef : undefined,
+      baselines: this.value.dirty ? this.value.baselines : undefined,
       requests: [...this.value.requests, { id: randomUUID(), text, source }] });
   }
   begin(proposal: Proposal): number {

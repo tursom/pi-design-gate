@@ -65,7 +65,7 @@ export async function inspect(pi: ExtensionAPI, ctx: ExtensionContext, action: s
     command = 'git';
     args = ['--no-optional-locks', '--no-pager', '-c', 'core.fsmonitor=false'];
     if (action === 'status') args.push('status', '--short');
-    else if (action === 'diff') args.push('diff', '--no-ext-diff', '--no-textconv', 'HEAD', '--');
+    else if (action === 'diff') args.push('diff', '--no-ext-diff', '--no-textconv', await workspaceReference(pi, ctx, signal), '--');
     else if (action === 'log') args.push('log', '-8', '--oneline');
     else throw new Error('未知只读查询。');
   }

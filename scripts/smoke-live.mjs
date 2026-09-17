@@ -9,7 +9,9 @@ const model = process.argv[2];
 if (!model) throw new Error('Usage: node scripts/smoke-live.mjs provider/model');
 const project = resolve(import.meta.dirname, '..');
 const cwd = await mkdtemp(join(tmpdir(), 'pi-design-gate-live-'));
-execFileSync('git', ['init', '-q', cwd]);
+const nested = process.argv.includes('--nested');
+const target = nested ? 'service/hello.txt' : 'hello.txt';
+execFileSync('git', ['init', '-q', nested ? join(cwd, 'service') : cwd]);
 const child = spawn(resolve(project, 'node_modules/.bin/pi'), [
   '--mode', 'rpc', '--no-session', '--offline', '--no-extensions',
   '-e', resolve(project, 'src/index.ts'), '--no-skills', '--no-prompt-templates',
@@ -41,16 +43,16 @@ child.stdout.on('data', chunk => {
 child.on('error', error => settled(error.message));
 child.on('exit', code => { if (!done) settled(`exit ${code}`); });
 child.stdin.write(JSON.stringify({ type: 'prompt', id: 'smoke', message:
-  '在当前临时Git项目创建 hello.txt，内容恰好为 hello 加一个换行。只需要这个文件，不新增依赖、配置或测试。请使用设计门禁的正常流程完成；不要提交或推送。' }) + '\n');
+  `在当前临时项目创建 ${target}，内容恰好为 hello 加一个换行。${nested ? '当前项目目录不是Git仓库，实际工作仓库为子目录service。' : ''}只需要这个文件，不新增依赖、配置或测试。请使用设计门禁的正常流程完成；不要提交或推送。` }) + '\n');
 const outcome = await completion;
 clearTimeout(timer);
 child.kill('SIGTERM');
 await writeFile(join(cwd, 'rpc-events.json'), JSON.stringify(events, null, 2));
 await writeFile(join(cwd, 'rpc-stderr.txt'), stderr);
-const result = await readFile(join(cwd, 'hello.txt'), 'utf8').catch(() => null);
+const result = await readFile(join(cwd, target), 'utf8').catch(() => null);
 const errors = events.filter(e => e.type === 'extension_error');
 const tools = events.filter(e => e.type === 'tool_execution_end').map(e => ({ tool: e.toolName, error: e.isError }));
 const verdicts = events.filter(e => e.type === 'message_end' && e.message?.customType === 'design-gate-review').map(e => e.message.content);
-const summary = { outcome, fileCorrect: result === 'hello\n', extensionErrors: errors.length, tools, verdicts, artifacts: cwd };
+const summary = { outcome, nested, fileCorrect: result === 'hello\n', extensionErrors: errors.length, tools, verdicts, artifacts: cwd };
 console.log(JSON.stringify(summary, null, 2));
 if (outcome !== 'settled' || result !== 'hello\n' || errors.length || !tools.some(t => t.tool === 'design_review' && !t.error)) process.exitCode = 1;

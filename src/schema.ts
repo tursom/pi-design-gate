@@ -13,6 +13,7 @@ export const ProposalSchema = Type.Object({
   goal: Text(),
   acceptance: List(),
   changes: List(),
+  repositories: Type.Optional(Type.Array(Text(), { minItems: 1, maxItems: 20 })),
   evidence: Type.Array(EvidenceSchema, { minItems: 1, maxItems: 20 }),
   mechanisms: Type.Array(Type.Object({
     name: Text(),

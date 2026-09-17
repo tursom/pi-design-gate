@@ -18,9 +18,9 @@ const pending: Review = { verdict: 'ask_user', reason: 'Failure tolerance is unk
   questions: [{ id: 'failure', question: 'Allow partial completion?', options: ['Yes', 'No'], recommendation: 'Yes' }] };
 const proposal = (reference: string): Proposal => ({ goal: 'Change the greeting', acceptance: ['Print hello'], changes: ['Edit app.txt'], evidence: [{ kind: 'request', reference }], mechanisms: [] });
 
-async function harness(reviewer: Reviewer = async () => ({ review: ready })) {
+async function harness(reviewer: Reviewer = async () => ({ review: ready }), initializeRepository = true) {
   const cwd = await mkdtemp(join(tmpdir(), 'pi-design-test-'));
-  await exec('git', ['init', '-q', cwd]);
+  if (initializeRepository) await exec('git', ['init', '-q', cwd]);
   const entries: any[] = [];
   const handlers = new Map<string, (...args: any[]) => any>();
   const tools = new Map<string, any>();
@@ -46,7 +46,7 @@ async function harness(reviewer: Reviewer = async () => ({ review: ready })) {
   const current = (): State => entries.filter(e => e.customType === 'design-gate/state-v1').at(-1)?.data;
   await emit('session_start');
   await emit('input', { text: 'Change app.txt to print hello', source: 'rpc' });
-  const submit = () => run('design_review', { action: 'submit', proposal: proposal(current().requests.at(-1)!.id) });
+  const submit = (repositories?: string[]) => run('design_review', { action: 'submit', proposal: { ...proposal(current().requests.at(-1)!.id), ...(repositories ? { repositories } : {}) } });
   const call = (toolName = 'write', input: Record<string, unknown> = { path: 'app.txt', content: 'hello' }, id = 'write-1') => emit('tool_call', { toolName, toolCallId: id, input });
   return { cwd, pi, ctx, entries, handlers, tools, commands, messages, emit, run, current, submit, call };
 }
@@ -155,7 +155,7 @@ test('snapshot includes staged and untracked changes and keeps pre-existing chan
   await writeFile(join(h.cwd, 'existing.txt'), 'existing user work');
   await exec('git', ['add', 'existing.txt'], { cwd: h.cwd });
   await h.submit();
-  assert.match(h.current().baseline!, /existing user work/);
+  assert.match(h.current().baselines![0].baseline, /existing user work/);
   await writeFile(join(h.cwd, 'new.txt'), 'new implementation');
   const snapshot = await workspaceSnapshot(h.pi, h.ctx);
   assert.match(snapshot, /existing user work/);
@@ -258,4 +258,93 @@ test('external writes remain blocked after a ready proposal until execute adapte
   const h = await harness();
   await h.submit();
   assert.match((await h.call('feishu_bitable', { action: 'create' })).reason, /执行入口复核/);
+});
+
+test('non-Git project can inspect, implement and audit an explicitly selected child repository', async () => {
+  const audits: any[] = [];
+  const h = await harness(async (_ctx, payload: any) => {
+    if (payload.mode === 'audit') audits.push(payload);
+    return { review: ready };
+  }, false);
+  await exec('git', ['init', '-q', join(h.cwd, 'service')]);
+  assert.equal((await h.run('design_inspect', { action: 'status', path: 'service' })).content[0].text, '');
+  assert.equal((await h.run('design_inspect', { action: 'diff', path: 'service' })).content[0].text, '');
+  await assert.rejects(h.submit(), /repositories/);
+  await h.submit(['service']);
+  assert.deepEqual(h.current().repositories, [join(h.cwd, 'service')]);
+  const args = { path: 'service/app.txt', content: 'hello' };
+  assert.equal(await h.call('write', args, 'child'), undefined);
+  await h.tools.get('write').execute('child', args, undefined, undefined, h.ctx);
+  await h.emit('agent_end');
+  assert.equal(audits[0].projectDirectory, h.cwd);
+  assert.match(audits[0].repositoryChanges[0].current, /hello/);
+  assert.equal(h.current().dirty, false);
+});
+
+test('multiple repositories keep independent baselines; an omitted dirty repository is still audited', async () => {
+  const audits: any[] = [];
+  const h = await harness(async (_ctx, payload: any) => {
+    if (payload.mode === 'audit') audits.push(payload);
+    return { review: ready };
+  }, false);
+  for (const name of ['a', 'b', 'other']) await exec('git', ['init', '-q', join(h.cwd, name)]);
+  await writeFile(join(h.cwd, 'a', 'existing.txt'), 'existing user work');
+  await h.submit(['a', 'b']);
+  const initial = structuredClone(h.current().baselines);
+  assert.equal((await h.call('write', { path: 'other/app.txt', content: 'x' })).block, true);
+  assert.equal((await h.call('write', { path: 'project-note.txt', content: 'x' })).block, true);
+  for (const name of ['a', 'b']) {
+    const args = { path: `${name}/app.txt`, content: `change in ${name}` };
+    assert.equal(await h.call('write', args, name), undefined);
+    await h.tools.get('write').execute(name, args, undefined, undefined, h.ctx);
+  }
+  await h.emit('input', { source: 'rpc', text: 'Continue working only in b; retain previous work' });
+  await h.submit(['b']);
+  assert.deepEqual(h.current().baselines, initial);
+  assert.equal((await h.call('write', { path: 'a/extra.txt', content: 'x' })).block, true);
+  await h.emit('agent_end');
+  assert.equal(audits[0].repositoryChanges.length, 2);
+  assert.match(audits[0].repositoryChanges[0].baseline, /existing user work/);
+  assert.match(audits[0].repositoryChanges[0].current, /change in a/);
+  assert.match(audits[0].repositoryChanges[1].current, /change in b/);
+});
+
+test('repository aliases normalize to a single baseline and survive reload', async () => {
+  const h = await harness(undefined, false);
+  const repo = join(h.cwd, 'service');
+  await exec('git', ['init', '-q', repo]);
+  await mkdir(join(repo, 'src'));
+  await h.submit(['service', 'service/src', repo]);
+  assert.equal(h.current().baselines!.length, 1);
+  const initial = structuredClone(h.current().baselines);
+  await h.call('write', { path: 'service/src/a.txt', content: 'a' });
+  await h.emit('session_start');
+  assert.equal((await h.call()).block, true);
+  await h.submit(['service']);
+  assert.deepEqual(h.current().baselines, initial);
+});
+
+test('a Git worktree under a non-Git project is audited as its own worktree', async () => {
+  const h = await harness(undefined, false);
+  const main = join(h.cwd, 'main');
+  const worktree = join(h.cwd, 'worktree');
+  await exec('git', ['init', '-q', main]);
+  await exec('git', ['-c', 'user.name=Test', '-c', 'user.email=test@example.invalid', '-c', 'commit.gpgsign=false', 'commit', '--allow-empty', '-qm', 'initial'], { cwd: main });
+  await exec('git', ['worktree', 'add', '-qb', 'feature', worktree], { cwd: main });
+  await h.submit(['worktree']);
+  assert.deepEqual(h.current().repositories, [worktree]);
+  const args = { path: 'worktree/app.txt', content: 'hello' };
+  assert.equal(await h.call('write', args, 'worktree-write'), undefined);
+  await h.tools.get('write').execute('worktree-write', args, undefined, undefined, h.ctx);
+  await h.emit('agent_end');
+  assert.equal(h.current().dirty, false);
+  await assert.rejects(readFile(join(main, 'app.txt')), /ENOENT/);
+});
+
+test('repository selection and inspection reject paths outside the project', async () => {
+  const h = await harness(undefined, false);
+  const outside = await mkdtemp(join(tmpdir(), 'pi-design-other-'));
+  await exec('git', ['init', '-q', outside]);
+  await assert.rejects(h.submit([outside]), /当前项目/);
+  await assert.rejects(h.run('design_inspect', { action: 'status', path: outside }), /当前项目/);
 });

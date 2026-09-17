@@ -6,7 +6,7 @@
 
 ## 确定性测试
 
-`npm run check`：TypeScript 类型检查通过，98 个 node:test 用例全部通过，0 个跳过，0 个 TODO。
+`npm run check`：TypeScript 类型检查通过，103 个 node:test 用例全部通过，0 个跳过，0 个 TODO。
 
 覆盖：
 
@@ -70,3 +70,9 @@ pi --no-extensions -e ./scripts/eval-review.ts --no-skills --no-context-files \
 4. 将终审尝试计为完成：取消重复计数，仅以dirty和审查状态决定是否重审。
 
 外部工具无法直接获取execute包装入口，因此首版关闭外部写入而保留读取。不会把仅有tool_call预检描述为完整的执行时许可复核。
+
+## 非 Git 项目与实际工作仓库
+
+新增五组集成用例：非Git项目下的子仓库查询/实施/终审，多仓库独立基线与遗漏仓库保留，仓库路径去重及重载，Git worktree，项目外路径拒绝。原有单仓库和固定commit基线测试仍通过。
+
+真实运行 `node scripts/smoke-live.mjs yym/gpt-6-astra --nested`：PI会话cwd是非Git临时目录，实际仓库为service子目录。模型通过proposal.repositories声明service，完成创建6字节的`service/hello.txt`及最终差异审查；文件正确，扩展错误0，流程达到agent_settled。没有将项目父目录初始化为Git仓库，也没有修改全局配置。

@@ -6,7 +6,7 @@ PI 专用的设计必要性门禁。AI 必须先提交当前目标、依据和�
 
 ## 使用
 
-要求 Node.js 22.19+、PI `0.84.4`、Git、ripgrep。当前工作目录需要是 Git 仓库，空仓库也支持。
+要求 Node.js 22.19+、PI `0.84.4`、Git、ripgrep。PI 项目目录可以不是 Git 仓库；实际工作仓库可以是项目下的一个或多个子仓库，空仓库及 Git worktree 也支持。
 
 ```bash
 cd /root/dev/work/pi-design-gate
@@ -37,6 +37,30 @@ pi install /root/dev/work/pi-design-gate
 
 TUI 和 PI WEB 使用 `ctx.ui.select/input`。PI WEB 已有该扩展对话框的服务端处理。无 UI 模式仍能自动审查，但遇到产品决策会保持 `ask_user`，不会自动同意。
 
+## 项目目录与工作仓库
+
+例如 PI 会话位于 `/root/dev/work/yym`，实际修改的是其中两个服务：
+
+```json
+{
+  "action": "submit",
+  "proposal": {
+    "repositories": ["go-goods-serve", "finance-admin-service"],
+    "goal": "本次目标",
+    "acceptance": ["验收条件"],
+    "changes": ["需要修改的行为"],
+    "evidence": [{"kind": "request", "reference": "design_context 返回的请求 ID"}],
+    "mechanisms": []
+  }
+}
+```
+
+`repositories` 由 AI 根据任务填写，不需要修改全局配置或逐仓库审批。路径相对于 PI 会话目录，也可以使用项目内的绝对路径；仓库内子目录会解析到实际 Git 根目录并去重。省略时使用当前目录所在的仓库；非 Git 项目应明确提供实际仓库。
+
+调查时使用 `design_inspect({"action":"status","path":"go-goods-serve"})`。`path` 同样适用于 diff/log/files/search；查询不会改变会话 cwd，edit/write 的相对路径仍从会话目录计算。
+
+每个仓库分别保存固定 Git 基线，终审按仓库比较全部差异。增加仓库需要重提方案；存在未审改动时，旧仓库基线不会因新方案省略它而丢失。直接 edit/write 只允许进入本次声明的仓库；Bash 的目标仓库由执行前语义审查检查。项目目录外的路径仍不开放。
+
 ## 工作流程
 
 1. 插件在 `input` 中记录 interactive/rpc 输入及引用 ID，忽略 extension 注入的输入。
@@ -45,7 +69,7 @@ TUI 和 PI WEB 使用 `ctx.ui.select/input`。PI WEB 已有该扩展对话框的
 4. 插件使用当前模型另建上下文执行审查，不提供工具，也不使用主模型的思维过程作为证据。
 5. 审查结果决定后续行为。
 6. 放行后，每次已适配的实施调用还会独立检查是否符合方案。内建写工具在 `execute` 入口再次核对版本和参数，并使用 sequential 执行模式；执行前记录工作区待审状态。
-7. `agent_end` 自动核对 Git 基线与当前差异，包含暂存、未暂存及未跟踪文件。范围偏离会关闭后续实施，通知主模型处理。
+7. `agent_end` 自动核对每个实际工作仓库的 Git 基线与当前差异，包含暂存、未暂存及未跟踪文件。范围偏离会关闭后续实施，通知主模型处理。
 
 | 结果 | 主模型下一步 | 实施权限 |
 | --- | --- | --- |
@@ -91,7 +115,7 @@ TUI 和 PI WEB 使用 `ctx.ui.select/input`。PI WEB 已有该扩展对话框的
 - 结构化调查：`design_inspect` 的 files/search/status/diff/log，不执行模型拼接的 shell 字符串。
 - 委派：本版阻止 spawn_session/spawn_subsession/subagent/delegate_task。父会话的 hook 不会自动继承到子进程，尚未接入子会话权限继承。
 - 未知工具：阻断，需增加明确的 action 适配；不会根据工具描述猜测只读。
-- edit/write 路径必须在当前项目内，解析符号链接后检查；不开放 `.git` 和 `.pi` 内部路径。
+- edit/write 路径必须在当前项目内，并属于本次声明的工作仓库，解析符号链接后检查；不开放 `.git` 和 `.pi` 内部路径。
 - `ask_user` 可用于普通询问，但其文本结果不会改变插件审批状态。
 
 `design_review` 必须独立于实施工具调用。即使旧状态 ready，同一 assistant 消息里同时提交新设计并写入，也会拦下写入，不会假定并行工具已经完成审批。execute 入口还会检查预检后到达的新输入，以及被后续扩展修改过的参数；已经开始执行的副作用不能通过撤销许可回滚。
@@ -134,6 +158,8 @@ TUI 和 PI WEB 使用 `ctx.ui.select/input`。PI WEB 已有该扩展对话框的
 npm run check
 # 可选真实模型测试，只修改临时Git目录，使用已有模型配置
 node scripts/smoke-live.mjs provider/model
+# 验证非Git项目目录 + 子仓库的完整流程
+node scripts/smoke-live.mjs provider/model --nested
 # 可选：五个历史模式的语义审查评估（不会修改项目）
 pi --no-extensions -e ./scripts/eval-review.ts --no-skills --no-context-files \
   --model provider/model -p /evaluate-design-gate
@@ -141,4 +167,4 @@ pi --no-extensions -e ./scripts/eval-review.ts --no-skills --no-context-files \
 
 离线测试注入审查结果，验证状态与工具阻断，不声称验证模型语义质量。真实测试会产生模型费用；遇到产品决策只取消，不自动替用户批准。
 
-代码：`schema.ts` 定义契约，`state.ts` 管理版本与异步结果，`review.ts` 执行模型审查，`context.ts` 读取证据和 Git 差异，`gate.ts` 分类工具，`index.ts` 连接 PI 事件与 UI。
+代码：`schema.ts` 定义契约，`state.ts` 管理版本与异步结果，`review.ts` 执行模型审查，`context.ts` 读取证据和 Git 差异，`repositories.ts` 解析实际仓库并维护多仓库基线，`gate.ts` 分类工具，`index.ts` 连接 PI 事件与 UI。
