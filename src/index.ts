@@ -1,6 +1,6 @@
 import { Type } from 'typebox';
 import { createBashToolDefinition, createEditToolDefinition, createWriteToolDefinition, createPowerShellToolDefinition, type ExtensionAPI, type ExtensionContext, type ToolDefinition } from '@earendil-works/pi-coding-agent';
-import { inspect, projectPath, readEvidence } from './context.ts';
+import { inspect, projectPath, readEvidence, type ResolvedEvidence } from './context.ts';
 import { checkWriteRepository, repositoryBaselines, repositoryChanges, repositoryRoot, resolveRepositories } from './repositories.ts';
 import { classify, preliminaryGate, type Call } from './gate.ts';
 import { ProposalSchema, validateProposal, type Review } from './schema.ts';
@@ -164,25 +164,38 @@ export function registerDesignGate(pi: ExtensionAPI, reviewer: Reviewer = review
         await questions(ctx);
         return textResult(`当前状态：${state.value.status}。${state.value.status === 'ask_user' ? '等待用户决定，可用 /design review 重开对话框。' : '请按用户回答更新方案后重新提交。'}`);
       }
-      validateProposal(params.proposal);
       const proposal = params.proposal;
-      const epoch = state.begin(proposal);
+      const priorReview = state.value.review;
+      // Revoke old permits while validating; retain pending questions on error.
+      state.set({ ...state.value, status: 'investigate' });
+      const validationEpoch = state.epoch;
       permits.clear();
       status(ctx);
+      let evidence: ResolvedEvidence[];
       try {
-        const evidence = await readEvidence(ctx.cwd, proposal, state.value);
-        const repositories = await resolveRepositories(pi, ctx, proposal.repositories, signal);
+        validateProposal(proposal);
+        evidence = await readEvidence(ctx.cwd, proposal, state.value);
+      } catch (error) {
+        throw new Error(`证据参数需要修正，尚未调用审查模型：${failureText(error)}`);
+      }
+      signal?.throwIfAborted();
+      if (state.epoch !== validationEpoch) throw new Error('证据校验期间任务已变化，尚未调用审查模型，请重新提交。');
+      const epoch = state.begin(proposal!);
+      status(ctx);
+      try {
+        const repositories = await resolveRepositories(pi, ctx, proposal!.repositories, signal);
         const baselines = await repositoryBaselines(pi, ctx, repositories, state.value.baselines, signal);
         if (state.epoch !== epoch) throw new Error('任务已变化，请重新提交。');
         // Save without advancing the epoch of this in-flight review.
         state.value = { ...state.value, repositories, baselines };
         pi.appendEntry(STATE_ENTRY, state.value);
-        const result = await reviewer(ctx, payload('proposal', { evidence }), signal);
+        const result = await reviewer(ctx, payload('proposal', { evidence, priorReview }), signal);
         if (!state.finish(epoch, result.review)) throw new Error('任务已变化，审查结果已丢弃。');
         feedback(result.review);
         status(ctx);
         if (result.review.verdict === 'ask_user') await questions(ctx);
-        return { ...textResult(JSON.stringify({ review: result.review, currentStatus: state.value.status, answers: state.value.answers }), result.review), usage: result.usage };
+        const fileEvidence = evidence.filter(e => e.actualRange).map(e => ({ reference: e.reference, actualRange: e.actualRange }));
+        return { ...textResult(JSON.stringify({ review: result.review, currentStatus: state.value.status, answers: state.value.answers, fileEvidence }), { ...result.review, fileEvidence }), usage: result.usage };
       } catch (error) {
         state.fail(epoch, failureText(error));
         status(ctx);

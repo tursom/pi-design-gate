@@ -348,3 +348,36 @@ test('repository selection and inspection reject paths outside the project', asy
   await assert.rejects(h.submit([outside]), /当前项目/);
   await assert.rejects(h.run('design_inspect', { action: 'status', path: outside }), /当前项目/);
 });
+
+test('evidence validation precedes reviewing, preserves pending context and revokes old permits', async () => {
+  let calls = 0;
+  const h = await harness(async () => { calls++; return { review: ready }; });
+  await h.submit();
+  const previousReview = h.current().review;
+  const args = { path: 'app.txt', content: 'hello' };
+  await h.call('write', args, 'old');
+  const checkpoint = h.entries.length;
+  await writeFile(join(h.cwd, 'source.txt'), 'one\ntwo\n');
+  const plan = proposal(h.current().requests.at(-1)!.id);
+  plan.evidence.push({ kind: 'file', reference: 'source.txt', startLine: 9 });
+  await assert.rejects(h.run('design_review', { action: 'submit', proposal: plan }), /尚未调用审查模型.*source.txt.*实际共 2 行/);
+  assert.equal(calls, 2);
+  assert.equal(h.current().status, 'investigate');
+  assert.deepEqual(h.current().review, previousReview);
+  assert.ok(!h.entries.slice(checkpoint).some(e => e.data?.status === 'reviewing'));
+  await assert.rejects(h.tools.get('write').execute('old', args, undefined, undefined, h.ctx), /执行入口复核失败/);
+  plan.evidence[1] = { kind: 'file', reference: 'source.txt', endLine: 999 };
+  const result = await h.run('design_review', { action: 'submit', proposal: plan });
+  assert.deepEqual(JSON.parse(result.content[0].text).fileEvidence[0].actualRange, { startLine: 1, endLine: 2, totalLines: 2 });
+  assert.equal(calls, 3);
+});
+
+test('invalid evidence does not discard an unresolved product question after user input', async () => {
+  const h = await harness(async () => ({ review: pending }));
+  await h.submit();
+  await h.emit('input', { source: 'rpc', text: 'What does partial completion mean?' });
+  const plan = proposal(h.current().requests.at(-1)!.id);
+  plan.evidence.push({ kind: 'file', reference: 'missing.txt' });
+  await assert.rejects(h.run('design_review', { action: 'submit', proposal: plan }), /尚未调用审查模型.*missing.txt/);
+  assert.deepEqual(h.current().review, pending);
+});

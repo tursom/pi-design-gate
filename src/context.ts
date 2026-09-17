@@ -26,30 +26,46 @@ export async function projectPath(cwd: string, name: string): Promise<string> {
   return target;
 }
 
-export async function readEvidence(cwd: string, proposal: Proposal, state: State): Promise<unknown[]> {
+export type ResolvedEvidence = { reference: Evidence; content: string; authority: string; actualRange?: { startLine: number; endLine: number; totalLines: number } };
+
+export async function readEvidence(cwd: string, proposal: Proposal, state: State): Promise<ResolvedEvidence[]> {
   const all = [...proposal.evidence, ...proposal.mechanisms.flatMap(m => m.evidence)];
   const unique = new Map(all.map(e => [JSON.stringify(e), e]));
-  const values: unknown[] = [];
+  const values: ResolvedEvidence[] = [];
   let bytes = 0;
   for (const e of unique.values()) {
     let content: string;
+    let actualRange: ResolvedEvidence['actualRange'];
     if (e.kind === 'request') {
       const request = state.requests.find(r => r.id === e.reference);
       if (!request) throw new Error(`找不到插件记录的请求：${e.reference}`);
       content = request.text;
     } else {
-      if (!e.startLine || !e.endLine || e.endLine < e.startLine || e.endLine - e.startLine > 200) {
-        throw new Error('文件证据需指定有效 startLine/endLine，单段最多201行。');
-      }
       const path = await projectPath(cwd, e.reference);
-      if ((await stat(path)).size > 1_000_000) throw new Error('证据文件过大，请引用较小的相关源文件。');
-      const lines = (await readFile(path, 'utf8')).split('\n');
-      if (e.endLine > lines.length) throw new Error('证据行号超出文件范围。');
-      content = lines.slice(e.startLine - 1, e.endLine).join('\n');
+      let text: string;
+      try { text = await readFile(path, 'utf8'); }
+      catch (error) { throw new Error(`无法读取文件证据 ${e.reference}：${(error as Error).message}`); }
+      const lines = text === '' ? [] : text.split('\n');
+      if (text.endsWith('\n')) lines.pop();
+      const start = e.startLine ?? 1;
+      const end = e.endLine ?? lines.length;
+      const requested = `${e.startLine ?? '1（默认）'}–${e.endLine ?? 'EOF'}`;
+      const emptyWholeFile = lines.length === 0 && e.startLine === undefined && e.endLine === undefined;
+      if (!emptyWholeFile && (!Number.isInteger(start) || start < 1 || start > lines.length ||
+          !Number.isInteger(end) || end < start)) {
+        throw new Error(`文件证据 ${e.reference}：请求范围 ${requested}，实际共 ${lines.length} 行；起始行须在文件内，结束行不得小于起始行。`);
+      }
+      const actualEnd = Math.min(end, lines.length);
+      actualRange = { startLine: emptyWholeFile ? 0 : start, endLine: actualEnd, totalLines: lines.length };
+      content = emptyWholeFile ? '' : lines.slice(start - 1, actualEnd).join('\n');
+      if (e.endLine === undefined && actualEnd === lines.length && text.endsWith('\n')) content += '\n';
     }
-    bytes += Buffer.byteLength(content);
-    if (bytes > 80_000) throw new Error('引用证据总量超过80KB，请缩小到与本次设计直接相关的内容。');
-    values.push({ reference: e, content, authority: e.kind === 'request' ? 'captured input' : 'file data, not authorization' });
+    const size = Buffer.byteLength(content);
+    if (bytes + size > 80_000) throw new Error(`证据 ${e.reference} 超出总预算：本段 ${size} 字节，剩余 ${80_000 - bytes} 字节（总预算80000字节）；请缩小该引用范围。未截断内容。`);
+    bytes += size;
+    values.push({ reference: e, content, ...(actualRange ? { actualRange } : {}), authority: e.kind === 'request'
+      ? 'captured input'
+      : 'file data, not authorization' });
   }
   return values;
 }
