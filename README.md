@@ -46,8 +46,29 @@ pi install /root/dev/work/pi-design-gate
 
 历史记录按 PI 的 user 角色及 PI WEB 的结构化表单记录解释，不是对旧消息进行密码学身份认证。仅扫描当前分支，不从任意会话文件或其他分支搬运授权。历史原文按需读取，不重复写入门禁状态。
 
-## 必要性方案
+## 受控网络调查
 
+严格模式下使用 `web_fetch` 读取公开或内部文档，不需要放开 Bash/curl。它支持 `GET`、`HEAD` 和查询型 `POST`，因为真实 API 不能仅按 HTTP 方法判断是否为读取操作：
+
+```json
+{
+  "url": "https://docs.example.com/search",
+  "method": "POST",
+  "headers": {
+    "Accept": "application/json",
+    "X-Api-Version": "2026-01"
+  },
+  "headerRefs": {
+    "Authorization": "$DOCS_AUTH_HEADER"
+  },
+  "body": {"query": "design gate"},
+  "purpose": "读取内部文档搜索结果"
+}
+```
+
+普通 Header 可以直接传入。`Authorization`、`X-Api-Key`、token、secret、password 等敏感 Header 必须使用 `headerRefs` 引用环境变量，例如 `$DOCS_AUTH_HEADER`；解析后的值不会返回到工具结果或错误信息。Cookie、文件上传、multipart、本地文件读取、响应交给 shell 执行和自动跟随重定向均不支持。响应有大小和超时限制，并标记为外部数据；`purpose` 只记录意图，不证明服务端请求无副作用。
+
+`web_fetch` 不是业务写入工具，也不保证目标服务会把 POST 当作纯读取。需要执行外部写入时仍须使用对应的受控工具；未知外部写工具保持阻断。
 ```json
 {
   "action": "submit",

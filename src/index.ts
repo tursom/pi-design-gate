@@ -6,6 +6,7 @@ import { ProposalSchema, validateProposal, type Review } from './schema.ts';
 import { reviewWithModel, type Reviewer } from './review.ts';
 import { GateState, STATE_ENTRY } from './state.ts';
 import { branchRequests, selectedRequests } from './history.ts';
+import { webFetch, WebFetchSchema, webFetchDescription, type WebFetchParams } from './web-fetch.ts';
 
 const textResult = (text: string, details: unknown = {}) => ({ content: [{ type: 'text' as const, text }], details });
 const failureText = (error: unknown) => error instanceof Error ? error.message : '设计审查失败。';
@@ -106,6 +107,15 @@ export function registerDesignGate(pi: ExtensionAPI, reviewer: Reviewer = review
       content: `设计门禁当前${state.value.armed ? `已启用，状态=${state.value.status}` : '未启用'}。普通任务无需启动门禁；需要必要性审查时先运行 /design start，再调用design_context和design_review。启动后必须与实施工具分开调用。ask_user默认在正常对话中讨论；明确决定后更新方案并重新审查。通过后按方案实施，范围改变需重新启动审查。`,
     },
   }) : undefined);
+
+  pi.registerTool({
+    name: 'web_fetch', label: 'Web Fetch', description: webFetchDescription(),
+    parameters: WebFetchSchema,
+    async execute(_id, params, signal) {
+      const result = await webFetch(params as WebFetchParams, signal);
+      return textResult(JSON.stringify(result), { externalData: true, purpose: params.purpose });
+    },
+  });
 
   pi.registerTool({
     name: 'design_context', label: 'Design Context',

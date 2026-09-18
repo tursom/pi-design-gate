@@ -7,6 +7,7 @@ const READ_TOOLS = new Set(['read', 'grep', 'find', 'ls', 'codex_memory', 'notif
   'list_subsessions', 'check_subsession', 'read_subsession', 'yield_to_subsessions']);
 const DELEGATION = new Set(['spawn_session', 'spawn_subsession', 'subagent', 'delegate_task']);
 export function classify(call: Call): CallKind {
+  if (call.toolName === 'web_fetch') return 'read';
   if (call.toolName === 'design_context' || call.toolName === 'design_inspect') return 'read';
   if (call.toolName === 'design_review') return 'control';
   if (READ_TOOLS.has(call.toolName)) return 'read';
