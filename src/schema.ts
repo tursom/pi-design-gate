@@ -5,7 +5,7 @@ const Text = () => Type.String({ minLength: 1, maxLength: 4000, pattern: '\\S' }
 const List = () => Type.Array(Text(), { minItems: 1, maxItems: 20 });
 export const EvidenceSchema = Type.Object({
   kind: Type.String({ enum: ['request', 'file'] }),
-  reference: Text(), // plugin-issued request ID or project-relative file
+  reference: Text(), // plugin-issued request ID or absolute/session-relative file
   startLine: Type.Optional(Type.Integer({ minimum: 1, description: '文件引用起始行（含），省略从第1行读取；两者都省略读取全文。' })),
   endLine: Type.Optional(Type.Integer({ minimum: 1, description: '文件引用结束行（含），省略或超过末尾读取到EOF；返回实际引用范围。' })),
 }, { additionalProperties: false });
@@ -13,7 +13,6 @@ export const ProposalSchema = Type.Object({
   goal: Text(),
   acceptance: List(),
   changes: List(),
-  repositories: Type.Optional(Type.Array(Text(), { minItems: 1, maxItems: 20 })),
   evidence: Type.Array(EvidenceSchema, { minItems: 1, maxItems: 20 }),
   mechanisms: Type.Array(Type.Object({
     name: Text(),

@@ -1,5 +1,4 @@
 import type { ExtensionContext } from '@earendil-works/pi-coding-agent';
-import { projectPath } from './context.ts';
 import type { GateState } from './state.ts';
 
 export type Call = { toolName: string; toolCallId: string; input: Record<string, unknown> };
@@ -32,6 +31,7 @@ export function hasSiblingReview(ctx: ExtensionContext): boolean {
 }
 
 export async function preliminaryGate(call: Call, state: GateState, ctx: ExtensionContext): Promise<string | undefined> {
+  if (!state.value.armed) return;
   const kind = classify(call);
   if (kind === 'read' || kind === 'control') return;
   if (kind === 'delegation') return '设计门禁尚未接入子会话权限继承，本版不允许启动子代理。请在当前会话完成工作。';
@@ -39,10 +39,5 @@ export async function preliminaryGate(call: Call, state: GateState, ctx: Extensi
   if (kind === 'unknown') return `设计门禁尚未适配工具 ${call.toolName}，无法确定其副作用。`;
   if (hasSiblingReview(ctx)) return 'design_review 必须与实施工具分开调用；当前批次不会继承同批审查的放行结果。';
   if (call.toolName === 'powershell' && process.platform !== 'win32') return '本平台未注册受控 PowerShell 执行入口。';
-  if (state.value.status !== 'ready') return `设计门禁：当前为 ${state.value.status}。先调用 design_context 获取依据，再用 design_review 提交方案；待确认问题用 /design review 处理。`;
-  if ((call.toolName === 'edit' || call.toolName === 'write')) {
-    if (typeof call.input.path !== 'string') return '缺少有效文件路径。';
-    try { await projectPath(ctx.cwd, call.input.path); }
-    catch (error) { return (error as Error).message; }
-  }
+  if (state.value.status !== 'ready') return `设计门禁：当前为 ${state.value.status}。先调用design_context获取依据，再用design_review提交方案；待确认问题用 /design review 处理。`;
 }

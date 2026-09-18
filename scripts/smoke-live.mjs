@@ -11,7 +11,7 @@ const project = resolve(import.meta.dirname, '..');
 const cwd = await mkdtemp(join(tmpdir(), 'pi-design-gate-live-'));
 const nested = process.argv.includes('--nested');
 const target = nested ? 'service/hello.txt' : 'hello.txt';
-execFileSync('git', ['init', '-q', nested ? join(cwd, 'service') : cwd]);
+if (nested) execFileSync('git', ['init', '-q', join(cwd, 'service')]);
 const child = spawn(resolve(project, 'node_modules/.bin/pi'), [
   '--mode', 'rpc', '--no-session', '--offline', '--no-extensions',
   '-e', resolve(project, 'src/index.ts'), '--no-skills', '--no-prompt-templates',
@@ -43,7 +43,7 @@ child.stdout.on('data', chunk => {
 child.on('error', error => settled(error.message));
 child.on('exit', code => { if (!done) settled(`exit ${code}`); });
 child.stdin.write(JSON.stringify({ type: 'prompt', id: 'smoke', message:
-  `在当前临时项目创建 ${target}，内容恰好为 hello 加一个换行。${nested ? '当前项目目录不是Git仓库，实际工作仓库为子目录service。' : ''}只需要这个文件，不新增依赖、配置或测试。请使用设计门禁的正常流程完成；不要提交或推送。` }) + '\n');
+  `在当前临时项目创建 ${target}，内容恰好为 hello 加一个换行。当前会话目录不是Git仓库。${nested ? '目标在service子目录的Git仓库内，不需要声明repositories。' : '本任务不需要Git仓库。'}只需要这个文件，不新增依赖、配置或测试。请使用设计门禁的正常流程完成；不要提交或推送。` }) + '\n');
 const outcome = await completion;
 clearTimeout(timer);
 child.kill('SIGTERM');

@@ -1,24 +1,22 @@
 import { Type } from 'typebox';
 import { createBashToolDefinition, createEditToolDefinition, createWriteToolDefinition, createPowerShellToolDefinition, type ExtensionAPI, type ExtensionContext, type ToolDefinition } from '@earendil-works/pi-coding-agent';
-import { inspect, projectPath, readEvidence, type ResolvedEvidence } from './context.ts';
-import { checkWriteRepository, repositoryBaselines, repositoryChanges, repositoryRoot, resolveRepositories } from './repositories.ts';
+import { inspect, evidencePath, readEvidence, type ResolvedEvidence } from './context.ts';
 import { classify, preliminaryGate, type Call } from './gate.ts';
 import { ProposalSchema, validateProposal, type Review } from './schema.ts';
 import { reviewWithModel, type Reviewer } from './review.ts';
 import { GateState, STATE_ENTRY } from './state.ts';
+import { branchRequests, selectedRequests } from './history.ts';
 
 const textResult = (text: string, details: unknown = {}) => ({ content: [{ type: 'text' as const, text }], details });
 const failureText = (error: unknown) => error instanceof Error ? error.message : '设计审查失败。';
 
 export function registerDesignGate(pi: ExtensionAPI, reviewer: Reviewer = reviewWithModel): void {
   const state = new GateState(value => pi.appendEntry(STATE_ENTRY, value));
-  const currentStatus = () => state.value.status;
   const permits = new Map<string, { epoch: number; input: string }>();
   let dialogOpen = false;
-  let projectDirectory = '';
 
-  // PI may preflight a batch before execution. Recheck the exact reviewed
-  // arguments and epoch at execute, rather than relying on a cached allow.
+  // PI can preflight siblings before executing them. Recheck the current plan
+  // and exact arguments at execute, without another model call.
   const factories: Array<(cwd: string) => ToolDefinition<any, any>> = [
     createBashToolDefinition, createEditToolDefinition, createWriteToolDefinition,
     ...(process.platform === 'win32' ? [createPowerShellToolDefinition] : []),
@@ -29,6 +27,10 @@ export function registerDesignGate(pi: ExtensionAPI, reviewer: Reviewer = review
       async execute(id, params, signal, onUpdate, ctx) {
         const permit = permits.get(id);
         permits.delete(id);
+        if (!state.value.armed) {
+          signal?.throwIfAborted();
+          return factory(ctx.cwd).execute(id, params, signal, onUpdate, ctx);
+        }
         if (!permit || permit.epoch !== state.epoch || state.value.status !== 'ready' || permit.input !== JSON.stringify(params)) {
           throw new Error('执行入口复核失败：方案、任务或工具参数已变化，请重新进行工具调用。');
         }
@@ -41,37 +43,36 @@ export function registerDesignGate(pi: ExtensionAPI, reviewer: Reviewer = review
   function status(ctx: ExtensionContext): void {
     if (ctx.hasUI) ctx.ui.setStatus('design-gate', `设计审查：${state.value.status} · v${state.value.version}`);
   }
-  const payload = (mode: string, extra: object = {}) => ({
-    mode,
-    capturedRequests: state.value.requests,
-    proposal: state.value.proposal,
-    projectDirectory,
-    repositories: state.value.repositories,
-    answers: state.value.answers,
-    priorReview: state.value.review,
-    ...extra,
-  });
   function feedback(review: Review): void {
+    const discussion = review.questions.length ? '\n\n待讨论的问题：\n' + review.questions.map((q, i) =>
+      `${i + 1}. ${q.question}\n可选做法：${q.options.join('；')}\n建议：${q.recommendation}`
+    ).join('\n\n') + '\n\n可以直接追问含义、原因或其他方案，理解后再决定；也可用 /design review 打开快捷选择。' : '';
     pi.sendMessage({ customType: 'design-gate-review', display: true,
-      content: `设计审查：${review.verdict}\n\n${review.reason}${review.findings.length ? '\n\n' + review.findings.map(f => `- ${f}`).join('\n') : ''}`,
+      content: `设计审查：${review.verdict}\n\n${review.reason}${review.findings.length ? '\n\n' + review.findings.map(f => `- ${f}`).join('\n') : ''}${discussion}`,
     }, { triggerTurn: false });
   }
-  async function questions(ctx: ExtensionContext): Promise<void> {
-    if (dialogOpen || !ctx.hasUI || state.value.status !== 'ask_user') return;
+  async function questions(ctx: ExtensionContext): Promise<'answered' | 'discussion' | undefined> {
+    if (dialogOpen || !ctx.hasUI || !['ask_user', 'investigate'].includes(state.value.status) || state.value.review?.verdict !== 'ask_user') return;
     dialogOpen = true;
     try {
-      while (state.value.status === 'ask_user' && state.value.review?.questions.length) {
+      while (['ask_user', 'investigate'].includes(state.value.status) && state.value.review?.verdict === 'ask_user' && state.value.review.questions.length) {
         const epoch = state.epoch;
         const q = state.value.review.questions[0];
-        const custom = '补充其他决定…';
+        const custom = '先讨论 / 自由补充…';
         const choice = await ctx.ui.select(`${q.question}\n推荐：${q.recommendation}`, [...q.options, custom]);
         if (state.epoch !== epoch || !choice) return;
-        let answer = choice;
         if (choice === custom) {
-          const entered = await ctx.ui.input(q.question, '输入你的决定');
+          const entered = await ctx.ui.input('可以提问、补充需求，或提出其他方案', q.question);
           if (state.epoch !== epoch || !entered?.trim()) return;
-          answer = entered.trim();
+          // Free text may be a question, a hypothetical or an actual decision.
+          // Preserve the original input for dialogue, never record it as a
+          // selected option or remove the unresolved question here.
+          state.request(`关于待讨论问题「${q.question}」，用户补充：\n${entered.trim()}`, ctx.mode === 'tui' ? 'interactive' : 'rpc');
+          permits.clear();
+          status(ctx);
+          return 'discussion';
         }
+        const answer = choice;
         const remaining = state.value.review!.questions.slice(1);
         state.set({ ...state.value,
           status: remaining.length ? 'ask_user' : 'investigate',
@@ -80,11 +81,11 @@ export function registerDesignGate(pi: ExtensionAPI, reviewer: Reviewer = review
         });
         status(ctx);
       }
+      return 'answered';
     } finally { dialogOpen = false; }
   }
 
   const restore = (ctx: ExtensionContext) => {
-    projectDirectory = ctx.cwd;
     state.restore(ctx.sessionManager.getBranch());
     permits.clear();
     status(ctx);
@@ -100,100 +101,88 @@ export function registerDesignGate(pi: ExtensionAPI, reviewer: Reviewer = review
     }
     return { action: 'continue' };
   });
-  pi.on('before_agent_start', () => ({
+  pi.on('before_agent_start', () => state.value.armed ? ({
     message: { customType: 'design-gate-context', display: false,
-      content: `设计门禁已启用，状态=${state.value.status}。实施前必须调用 design_context 获取插件记录的请求ID，再调用 design_review 提交当前目标、验收条件及新增机制的必要性判断。会话目录可以不是Git仓库：在proposal.repositories列出本次实际仓库路径（相对于会话目录），多仓库分别建基线；design_inspect.path选择查询目录。省略repositories时使用当前目录所在的仓库。简单修复可用空mechanisms。使用read/grep/find/ls或design_inspect调查；未放行时Bash不可用。design_review不得和实施工具同批调用。revise先简化，investigate先调查，ask_user等待插件对话框决定；不能通过ask_user的普通文字结果自行标记批准。已确认回答复用。子代理本版不开放。实施调用还会核对方案范围。`,
+      content: `设计门禁当前${state.value.armed ? `已启用，状态=${state.value.status}` : '未启用'}。普通任务无需启动门禁；需要必要性审查时先运行 /design start，再调用design_context和design_review。启动后必须与实施工具分开调用。ask_user默认在正常对话中讨论；明确决定后更新方案并重新审查。通过后按方案实施，范围改变需重新启动审查。`,
     },
-  }));
+  }) : undefined);
 
   pi.registerTool({
     name: 'design_context', label: 'Design Context',
-    description: '获取当前任务的真实输入ID、已有方案、审查结果及用户决定。只读。',
-    parameters: Type.Object({}),
-    async execute() {
-      const value = JSON.stringify(state.value, (key, value) => key === 'baseline' ? undefined : value, 2);
-      if (value.length > 45_000) {
-        return textResult(JSON.stringify({ status: state.value.status, version: state.value.version,
-          requests: state.value.requests.slice(-5), proposal: state.value.proposal,
-          repositories: state.value.repositories,
-          review: state.value.review, answers: state.value.answers,
-          note: '只展示最近5条输入；审查仍使用全部已捕获输入。' }, null, 2).slice(0, 48_000));
-      }
-      return textResult(value);
+    description: '获取当前分支的用户请求、历史决定、方案与审查状态。query搜索历史，offset/limit分页；session:entryId可作为request证据引用。只读。',
+    parameters: Type.Object({ query: Type.Optional(Type.String({ maxLength: 1000 })), offset: Type.Optional(Type.Integer({ minimum: 0 })), limit: Type.Optional(Type.Integer({ minimum: 1, maximum: 50 })) }),
+    async execute(_id, params, _signal, _update, ctx) {
+      const requests = branchRequests(ctx.sessionManager.getBranch(), state.value.requests);
+      const query = params.query?.toLocaleLowerCase();
+      const matching = query ? requests.filter(r => `${r.text}\n${r.context?.map(c => c.text).join('\n') ?? ''}`.toLocaleLowerCase().includes(query)) : requests;
+      const limit = params.limit ?? 20;
+      const offset = params.offset ?? Math.max(0, matching.length - limit);
+      const page = matching.slice(offset, offset + limit).map(r => ({ id: r.id, source: r.source, entryId: r.entryId,
+        text: r.text.slice(0, 1500), ...(r.text.length > 1500 ? { truncated: true } : {}),
+        context: r.context?.map(c => ({ ...c, text: c.text.slice(0, 500), ...(c.text.length > 500 ? { truncated: true } : {}) })),
+      }));
+      const value = JSON.stringify({ ...state.value, requests: page, totalRequests: requests.length,
+        matchedRequests: matching.length, offset, nextOffset: offset + limit < matching.length ? offset + limit : null,
+        note: '只展示当前分支的请求索引；引用ID时读取完整原文。历史assistant仅用于解释简短回答，不作为用户授权。' }, null, 2);
+      return textResult(value.length > 48_000 ? value.slice(0, 48_000) + '\n[输出截断，请用query或较小limit缩小范围]' : value);
     },
   });
   pi.registerTool({
     name: 'design_inspect', label: 'Design Inspect',
-    description: '设计阶段的结构化只读查询：files/search/status/diff/log。path相对于会话目录，选择实际工作仓库或搜索目录；search使用pattern。不执行shell字符串，输出最多约40KB。',
+    description: '设计阶段的结构化只读查询：files/search/status/diff/log。path可为绝对路径或相对会话目录路径；search使用pattern。不执行shell字符串，输出最多约40KB。仅Git查询需要仓库。',
     parameters: Type.Object({ action: Type.String({ enum: ['files', 'search', 'status', 'diff', 'log'] }), pattern: Type.Optional(Type.String({ maxLength: 1000 })), path: Type.Optional(Type.String({ minLength: 1 })) }),
     async execute(_id, params, signal, _update, ctx) {
-      const cwd = ['status', 'diff', 'log'].includes(params.action)
-        ? await repositoryRoot(pi, ctx, params.path ?? '.', signal)
-        : await projectPath(ctx.cwd, params.path ?? '.');
+      const cwd = evidencePath(ctx.cwd, params.path ?? '.');
       return textResult(await inspect(pi, { ...ctx, cwd }, params.action, params.pattern, signal));
     },
   });
 
-  async function audit(ctx: ExtensionContext, signal?: AbortSignal) {
-    if (!state.value.proposal || !state.value.baselines?.length) throw new Error('尚无方案和工作仓库基线。');
-    const epoch = state.epoch;
-    const changes = await repositoryChanges(pi, ctx, state.value.baselines, signal);
-    if (state.epoch !== epoch) throw new Error('上下文已变化，工作区审查取消。');
-    if (changes.every(c => c.current === c.baseline)) { state.clean(); return textResult('所有工作仓库均与审查基线一致。'); }
-    const result = await reviewer(ctx, payload('audit', { repositoryChanges: changes }), signal);
-    if (!state.finish(epoch, result.review)) throw new Error('审查期间任务已变化，未使用过期结果。');
-    if (result.review.verdict === 'ready') state.clean();
-    feedback(result.review);
-    status(ctx);
-    return { ...textResult(JSON.stringify(result.review), result.review), usage: result.usage };
-  }
-
   pi.registerTool({
     name: 'design_review', label: 'Design Review',
-    description: '必须在实施前提交必要性方案。submit进行独立审查，ask_user由插件UI确认；audit核对最终Git差异。单独调用，不能与实施工具并行。',
-    parameters: Type.Object({ action: Type.String({ enum: ['submit', 'audit'] }), proposal: Type.Optional(ProposalSchema) }, { additionalProperties: false }),
+    description: '实施前提交必要性方案并独立审查；产品取舍交由用户决定。单独调用，不能与实施工具并行。',
+    parameters: Type.Object({ action: Type.String({ enum: ['submit'] }), proposal: ProposalSchema }, { additionalProperties: false }),
     async execute(_id, params, signal, _update, ctx) {
+      if (params.action !== 'submit') throw new Error('design_review仅支持submit；不再执行工作区终审。');
+      if (!state.value.armed) throw new Error('设计门禁未启动，请先运行 /design start。普通任务无需启动设计门禁。');
       if (state.value.status === 'reviewing') throw new Error('已有设计审查正在进行。');
-      if (params.action === 'audit') {
-        if (state.value.status !== 'ready') throw new Error('待解决决策不能通过audit绕过，请先完成方案审查。');
-        return audit(ctx, signal);
-      }
-      // Pending decisions cannot be erased by resubmitting the same or another
-      // proposal. The user can choose the simplest option, then resubmit.
+      // Resubmitting alone cannot erase a pending decision. Real user input is
+      // captured by the input hook and can supply an answer for the next review.
       if (state.value.status === 'ask_user') {
-        await questions(ctx);
-        return textResult(`当前状态：${state.value.status}。${state.value.status === 'ask_user' ? '等待用户决定，可用 /design review 重开对话框。' : '请按用户回答更新方案后重新提交。'}`);
+        return textResult(JSON.stringify({ currentStatus: 'ask_user', review: state.value.review,
+          next: '待决问题留在对话中。先解释用户不理解的内容，允许追问和调整选项；等真实用户决定后再提交方案，不要重复弹窗或把问题当作已回答。' }));
       }
       const proposal = params.proposal;
       const priorReview = state.value.review;
-      // Revoke old permits while validating; retain pending questions on error.
+      // Revoke old permits immediately, but preserve pending questions until
+      // valid evidence is ready for an actual model review.
       state.set({ ...state.value, status: 'investigate' });
       const validationEpoch = state.epoch;
       permits.clear();
       status(ctx);
+      const requests = branchRequests(ctx.sessionManager.getBranch(), state.value.requests);
       let evidence: ResolvedEvidence[];
       try {
         validateProposal(proposal);
-        evidence = await readEvidence(ctx.cwd, proposal, state.value);
+        evidence = await readEvidence(ctx.cwd, proposal, { ...state.value, requests });
       } catch (error) {
         throw new Error(`证据参数需要修正，尚未调用审查模型：${failureText(error)}`);
       }
       signal?.throwIfAborted();
       if (state.epoch !== validationEpoch) throw new Error('证据校验期间任务已变化，尚未调用审查模型，请重新提交。');
-      const epoch = state.begin(proposal!);
+      const epoch = state.begin(proposal);
       status(ctx);
       try {
-        const repositories = await resolveRepositories(pi, ctx, proposal!.repositories, signal);
-        const baselines = await repositoryBaselines(pi, ctx, repositories, state.value.baselines, signal);
+        const references = [...proposal.evidence, ...proposal.mechanisms.flatMap(m => m.evidence)]
+          .filter(e => e.kind === 'request').map(e => e.reference);
         if (state.epoch !== epoch) throw new Error('任务已变化，请重新提交。');
-        // Save without advancing the epoch of this in-flight review.
-        state.value = { ...state.value, repositories, baselines };
-        pi.appendEntry(STATE_ENTRY, state.value);
-        const result = await reviewer(ctx, payload('proposal', { evidence, priorReview }), signal);
+        const result = await reviewer(ctx, {
+          mode: 'proposal', capturedRequests: selectedRequests(requests, references), proposal,
+          projectDirectory: ctx.cwd, answers: state.value.answers, priorReview, evidence,
+        }, signal);
+        signal?.throwIfAborted();
         if (!state.finish(epoch, result.review)) throw new Error('任务已变化，审查结果已丢弃。');
         feedback(result.review);
         status(ctx);
-        if (result.review.verdict === 'ask_user') await questions(ctx);
         const fileEvidence = evidence.filter(e => e.actualRange).map(e => ({ reference: e.reference, actualRange: e.actualRange }));
         return { ...textResult(JSON.stringify({ review: result.review, currentStatus: state.value.status, answers: state.value.answers, fileEvidence }), { ...result.review, fileEvidence }), usage: result.usage };
       } catch (error) {
@@ -208,83 +197,47 @@ export function registerDesignGate(pi: ExtensionAPI, reviewer: Reviewer = review
     const call = event as Call;
     const block = (reason: string) => ({ block: true as const, reason });
     try {
+      if (!state.value.armed) return;
       const epoch = state.epoch;
       const reason = await preliminaryGate(call, state, ctx);
       if (reason) return block(reason);
       if (classify(call) !== 'mutation') return;
-      if (call.toolName === 'edit' || call.toolName === 'write') {
-        await checkWriteRepository(pi, ctx, String(call.input.path), state.value.repositories ?? []);
-      }
       if (state.epoch !== epoch || state.value.status !== 'ready') return block('初步检查期间任务已变化，未放行。');
-      const result = await reviewer(ctx, payload('operation', { tool: call }), ctx.signal);
-      // Persist nested usage on the eventual tool result, including blocked calls.
-      usageByCall.set(call.toolCallId, result.usage);
-      if (state.epoch !== epoch) return block('任务或方案已变化，未执行过期审查对应的操作。');
-      if (result.review.verdict !== 'ready') {
-        state.finish(epoch, result.review);
-        feedback(result.review);
-        status(ctx);
-        return block(`设计门禁：${result.review.verdict}。${result.review.reason}`);
-      }
-      // Mark before execution so a crash between the side effect and tool_result
-      // cannot make the next session treat unreviewed work as a clean baseline.
-      state.markDirty();
       permits.set(call.toolCallId, { epoch, input: JSON.stringify(call.input) });
     } catch (error) {
       return block(`设计门禁检查失败，未放行：${failureText(error)}`);
     }
   });
-  const usageByCall = new Map<string, Awaited<ReturnType<Reviewer>>['usage']>();
-  pi.on('tool_result', (event) => {
-    const usage = usageByCall.get(event.toolCallId);
-    usageByCall.delete(event.toolCallId);
-    if (!usage) return;
-    if (!event.usage) return { usage };
-    return { usage: {
-      input: usage.input + event.usage.input, output: usage.output + event.usage.output,
-      cacheRead: usage.cacheRead + event.usage.cacheRead, cacheWrite: usage.cacheWrite + event.usage.cacheWrite,
-      totalTokens: usage.totalTokens + event.usage.totalTokens,
-      cost: Object.fromEntries(Object.keys(usage.cost).map(k => [k, usage.cost[k as keyof typeof usage.cost] + event.usage!.cost[k as keyof typeof usage.cost]])) as typeof usage.cost,
-    } };
-  });
-
-  pi.on('agent_end', async (_event, ctx) => {
-    if (state.value.status === 'ask_user') {
-      await questions(ctx);
-      if (currentStatus() === 'investigate') pi.sendMessage({ customType: 'design-gate-answer', display: true,
-        content: '用户已回答设计问题，请读取design_context并按决定更新方案。' }, { triggerTurn: true, deliverAs: 'followUp' });
-      return;
-    }
-    if (!state.value.dirty || state.value.status !== 'ready') return;
-    const epoch = state.epoch;
-    try {
-      // Run in the extension rather than asking the main model to remember a
-      // final tool call. This audit can report drift after the final text has
-      // streamed, but cannot retract that text or undo an external side effect.
-      const result = await audit(ctx, ctx.signal);
-      if ('usage' in result && result.usage) pi.appendEntry('design-gate/automatic-audit-usage', result.usage);
-      if (currentStatus() === 'ask_user') await questions(ctx);
-      if (currentStatus() !== 'ready') pi.sendMessage({ customType: 'design-gate-audit-needed', display: true,
-        content: '实际改动未通过设计范围审查。请读取design_context，处理发现的问题；不要声称已完成核验。' },
-        { triggerTurn: true, deliverAs: 'followUp' });
-    } catch (error) {
-      state.fail(epoch, failureText(error));
-      status(ctx);
-      pi.sendMessage({ customType: 'design-gate-audit-error', display: true,
-        content: `工作区审查未完成：${failureText(error)}。写入保持关闭；请调查后重新提交方案。` }, { triggerTurn: false });
-    }
-  });
 
   pi.registerCommand('design', {
-    description: '查看设计门禁状态，或用 /design review 回答待确认问题；没有模型可调用的批准入口。',
+    description: '使用 /design start 启动必要性审查流程；/design stop 恢复普通任务直通；/design review 打开待决问题快捷选择。',
     async handler(args, ctx) {
-      if (args.trim() === 'review') {
-        await questions(ctx);
-        if (state.value.status === 'investigate') pi.sendMessage({ customType: 'design-gate-answer', display: true,
-          content: '设计问题已回答。请读取design_context，按已确认决定更新方案并提交design_review。' }, { triggerTurn: true, deliverAs: 'followUp' });
+      const command = args.trim();
+      if (command === 'start') {
+        state.start();
+        permits.clear();
+        status(ctx);
+        pi.sendMessage({ customType: 'design-gate-status', display: true,
+          content: '设计门禁已启动。请调用 design_context 调查当前任务，再提交 design_review。' }, { triggerTurn: false });
+        return;
+      }
+      if (command === 'stop') {
+        state.stop();
+        permits.clear();
+        status(ctx);
+        pi.sendMessage({ customType: 'design-gate-status', display: true,
+          content: '设计门禁已停止，普通任务恢复直通。' }, { triggerTurn: false });
+        return;
+      }
+      if (command === 'review') {
+        const outcome = await questions(ctx);
+        if (outcome) pi.sendMessage({ customType: 'design-gate-answer', display: true,
+          content: outcome === 'discussion'
+            ? '用户提供了自由补充。请读取design_context，区分追问、假设与明确决定：追问时先回应疑问、解释具体影响，不要立即重抛原选择题，也不要把问题记作选择；如果已经明确决定，则按决定更新方案并审查，无需再作形式确认。'
+            : '用户已明确选择。请读取design_context，按已有决定更新方案并提交design_review；尚未回答的问题可以继续讨论。' }, { triggerTurn: true, deliverAs: 'followUp' });
       } else {
         pi.sendMessage({ customType: 'design-gate-status', display: true,
-          content: `状态：${state.value.status}；方案 v${state.value.version}\n${state.value.review?.reason ?? '等待必要性方案。'}\n待确认：${state.value.review?.questions.length ?? 0}；未完成差异审查：${state.value.dirty}` }, { triggerTurn: false });
+          content: `状态：${state.value.status}；门禁${state.value.armed ? '已启动' : '未启动'}；方案 v${state.value.version}\n${state.value.review?.reason ?? '等待必要性方案。'}\n待确认：${state.value.review?.questions.length ?? 0}` }, { triggerTurn: false });
       }
     },
   });

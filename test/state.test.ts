@@ -21,6 +21,7 @@ const entry = (state: State) => ({ type: 'custom', customType: STATE_ENTRY, data
 function fixture() {
   const persisted: State[] = [];
   const gate = new GateState(state => persisted.push(structuredClone(state)));
+  gate.start();
   gate.request('Require a design review', 'interactive');
   const plan = proposal(gate.value.requests[0]!.id);
   return { gate, persisted, plan };
@@ -72,7 +73,7 @@ test('restore selects the latest state on the supplied branch and does not carry
   const ancestor = structuredClone(gate.value);
   gate.request('Branch A only', 'interactive');
   const branchA = structuredClone(gate.value);
-  const branchB: State = { ...ancestor, version: 9, answers: [answer(8)], dirty: true };
+  const branchB: State = { ...ancestor, version: 9, answers: [answer(8)] };
   gate.begin(plan);
   const writes = persisted.length;
   gate.restore([entry(ancestor), entry(branchA)]);
@@ -97,7 +98,7 @@ for (const status of ['reviewing', 'ready'] as const) {
     const snapshot: State = {
       ...gate.value, version: 7, status, proposal: plan,
       review: status === 'ready' ? ready() : undefined,
-      answers: [answer(6)], dirty: true,
+      answers: [answer(6)],
     };
     const epoch = gate.epoch;
     const writes = persisted.length;
@@ -143,24 +144,13 @@ for (const invalidation of ['request', 'begin', 'restore'] as const) {
   });
 }
 
-for (const cleanBeforeFinish of [false, true]) {
-  test(`dirty bookkeeping preserves a concurrent review epoch (clean=${cleanBeforeFinish})`, async () => {
-    const { gate, plan, persisted } = fixture();
-    const epoch = gate.begin(plan);
-    const version = gate.value.version;
-    const completion = Promise.resolve().then(() => gate.finish(epoch, ready()));
-    gate.markDirty();
-    assert.equal(gate.value.dirty, true);
-    assert.equal(persisted.at(-1)!.dirty, true);
-    if (cleanBeforeFinish) gate.clean();
-    assert.equal(gate.epoch, epoch);
-    assert.equal(gate.value.version, version);
-    assert.equal(await completion, true);
-    assert.equal(gate.value.status, 'ready');
-    assert.equal(gate.value.dirty, !cleanBeforeFinish);
-    assert.deepEqual(persisted.at(-1), gate.value);
-  });
-}
+test('restore discards obsolete audit state while retaining requests, answers and pending review', () => {
+  const { gate, plan } = fixture();
+  const current: State = { ...gate.value, proposal: plan, review: ask(), status: 'ask_user', answers: [answer(1)] };
+  const legacy = { ...current, dirty: true, baselines: [{ root: '/old', baseline: 'large old diff' }], repositories: ['/old'] };
+  gate.restore([entry(legacy)]);
+  assert.deepEqual(gate.value, current);
+});
 
 test('a stale failure cannot overwrite a newer successful review', () => {
   const { gate, plan, persisted } = fixture();
